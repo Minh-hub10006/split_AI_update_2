@@ -1,6 +1,0 @@
-*.pt
-*.pth
-weight/
-__pycache__/
-venv/
-.env
