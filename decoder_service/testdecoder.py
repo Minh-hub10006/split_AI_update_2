@@ -7,92 +7,69 @@ from src.core.yaml_config import YAMLConfig
 
 cfg = YAMLConfig("configs/dfine/dfine_hgnetv2_l_coco.yml")
 model = cfg.model
-
 decoder = model.decoder
 decoder.load_state_dict(torch.load("weight/decoder.pth", map_location="cpu"))
-
 decoder.eval()
 
-
 def run_decoder(feats):
-
     with torch.no_grad():
         outputs = decoder(feats)
-
     return outputs
 
-
-def draw_boxes(image, boxes, scores, threshold=0.5):
-
-    img = image.copy()
-
-    h, w = img.shape[:2]
-
-    for box, score in zip(boxes, scores):
-
-        if score < threshold:
-            continue
-
-        cx, cy, bw, bh = box
-
-        x1 = int((cx - bw/2) * w)
-        y1 = int((cy - bh/2) * h)
-        x2 = int((cx + bw/2) * w)
-        y2 = int((cy + bh/2) * h)
-
-        cv2.rectangle(img,(x1,y1),(x2,y2),(0,255,0),2)
-
-        cv2.putText(img,
-                    f"{score:.2f}",
-                    (x1,y1-5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0,255,0),
-                    1)
-
-    return img
-
+def send_to_predictor(payload):
+    """Gửi predictions qua MQ"""
+    conn = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
+    ch = conn.channel()
+    ch.queue_declare(queue="predict_queue")
+    data = pickle.dumps(payload)
+    ch.basic_publish(exchange="", routing_key="predict_queue", body=data)
+    conn.close()
 
 def callback(ch, method, properties, body):
+    try:
+        payload = pickle.loads(body)
+        frame_id = payload["frame_id"]
+        feats_np = payload["feature"]  # numpy từ encoder
+        shape = payload["shape"]
+        
+        print(f"📥 Decoder frame {frame_id}")
+        
+        # Chuyển numpy → tensor
+        if isinstance(feats_np, list):
+            feats = [torch.from_numpy(f).float() for f in feats_np]
+        else:
+            feats = torch.from_numpy(feats_np).float()
+        
+        # Decode
+        outputs = run_decoder(feats)
+        pred_logits = outputs["pred_logits"][0]
+        pred_boxes = outputs["pred_boxes"][0]
+        
+        scores = pred_logits.softmax(-1).max(-1)[0].cpu().numpy()
+        boxes = pred_boxes.cpu().numpy()
+        
+        # Payload cho predictor
+        pred_payload = {
+            "frame_id": frame_id,
+            "boxes": boxes,
+            "scores": scores,
+            "shape": shape,
+        }
+        
+        send_to_predictor(pred_payload)
+        print(f"📤 Sent predictions frame {frame_id}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        
+    except Exception as e:
+        print(f"❌ Decoder error: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
-    payload = pickle.loads(body)
-
-    image = payload["image"]
-    feats = payload["feature"]
-
-    print("Received image + feature")
-
-    outputs = run_decoder(feats)
-
-    pred_logits = outputs["pred_logits"][0]
-    pred_boxes = outputs["pred_boxes"][0]
-
-    scores = pred_logits.softmax(-1).max(-1)[0]
-
-    boxes = pred_boxes.cpu().numpy()
-    scores = scores.cpu().numpy()
-
-    result = draw_boxes(image, boxes, scores)
-
-    cv2.imwrite("result.jpg", result)
-
-    print("Saved result.jpg")
-
-
-connection = pika.BlockingConnection(
-    pika.ConnectionParameters("localhost")
-)
-
+# MQ setup
+connection = pika.BlockingConnection(pika.ConnectionParameters("localhost"))
 channel = connection.channel()
-
 channel.queue_declare(queue="feature_queue")
 
-channel.basic_consume(
-    queue="feature_queue",
-    on_message_callback=callback,
-    auto_ack=True
-)
-
-print("Waiting for data...")
-
+print("🎯 Decoder ready - listening feature_queue...")
+channel.basic_qos(prefetch_count=1)
+channel.basic_consume(queue="feature_queue", on_message_callback=callback)
 channel.start_consuming()
